@@ -1,0 +1,26 @@
+# electron-builder 打包配置
+# 用法：npm run dist
+appId: com.framelessviewer.app
+productName: FramelessViewer
+
+directories:
+  output: dist
+  buildResources: build
+
+# 只把运行需要的东西打进 app.asar
+files:
+  - src/**/*
+  - package.json
+  - '!**/*.{md,map}'
+
+win:
+  icon: build/icon.ico
+  target:
+    - target: portable
+      arch:
+        - x64
+  artifactName: FramelessViewer-${version}-portable.${ext}
+
+portable:
+  # 免安装单文件；运行时解压到这个目录名下
+  unpackDirName: FramelessViewer
