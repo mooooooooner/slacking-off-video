@@ -1,0 +1,17 @@
+{
+  "name": "framelessviewer",
+  "version": "0.2.0",
+  "private": true,
+  "author": "moooooooner",
+  "description": "无边框透明浏览器 —— 只有页面，没有地址栏/标签栏/标题栏",
+  "main": "src/main.js",
+  "scripts": {
+    "start": "electron .",
+    "dev": "electron . --dev",
+    "dist": "electron-builder --win portable"
+  },
+  "devDependencies": {
+    "electron": "^44.5.1",
+    "electron-builder": "^26.15.3"
+  }
+}
