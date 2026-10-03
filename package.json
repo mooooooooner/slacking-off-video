@@ -1,6 +1,6 @@
 {
   "name": "framelessviewer",
-  "version": "0.2.0",
+  "version": "0.4.1",
   "private": true,
   "author": "moooooooner",
   "description": "无边框透明浏览器 —— 只有页面，没有地址栏/标签栏/标题栏",

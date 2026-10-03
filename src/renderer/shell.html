@@ -14,7 +14,7 @@
     <div id="drag-strip"></div>
 
     <!-- 网页内容 -->
-    <webview id="view" src="about:blank"></webview>
+    <webview id="view" src="about:blank" allowpopups></webview>
 
     <!-- 右上角控制入口：平时隐藏，鼠标碰到顶部才浮现 -->
     <div id="pill-zone">
@@ -30,6 +30,9 @@
         </svg>
       </button>
     </div>
+
+    <!-- 当前窗口模式：非普通模式时常驻，提醒点击是否可用（穿透时点击会落空） -->
+    <div id="mode-badge" class="hidden" aria-live="polite"></div>
 
     <!-- 控制面板 -->
     <section id="panel" class="hidden" aria-label="控制面板">
@@ -53,11 +56,19 @@
         </div>
       </div>
 
+      <div class="row">
+        <span class="row-label">窗口模式</span>
+        <span class="value">置顶 · 穿透 · 悬浮</span>
+      </div>
+      <div class="chips">
+        <button class="chip" type="button" data-mode="normal" title="不置顶、不穿透">普通</button>
+        <button class="chip" type="button" data-mode="floating" title="置顶 + 预设不透明度 (Ctrl+Alt+F)">悬浮</button>
+        <button class="chip" type="button" data-mode="through" title="置顶 + 鼠标穿透 (Ctrl+Alt+F)">穿透</button>
+      </div>
+
       <div class="chips wrap">
-        <button class="chip" type="button" data-toggle="mode" title="Ctrl+Alt+F">悬浮模式</button>
-        <button class="chip" type="button" data-toggle="top" title="Ctrl+Alt+T">窗口置顶</button>
-        <button class="chip" type="button" data-toggle="through" title="Ctrl+Alt+M">鼠标穿透</button>
         <button class="chip" type="button" data-toggle="scrollbars" title="Ctrl+Alt+S">隐藏滚动条</button>
+        <button class="chip" type="button" data-toggle="startanimation" title="开屏时播放动画">开屏动画</button>
       </div>
 
       <div class="row">
@@ -78,7 +89,7 @@
       </div>
 
       <footer class="panel-foot">
-        <kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>F</kbd> 悬浮 ·
+        <kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>F</kbd> 模式 ·
         <kbd>Ctrl</kbd>+<kbd>L</kbd> 网址 ·
         <kbd>Esc</kbd> 隐藏 ·
         <kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>Q</kbd> 关闭
