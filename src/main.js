@@ -53,6 +53,29 @@ const SIZE_PRESETS = [
 
 const OPACITY_PRESETS = [100, 90, 80, 70, 60, 50, 40, 30, 20, 10];
 
+/** 统一窗口模式：把「置顶 / 鼠标穿透 / 悬浮」合并成一个循环快捷键。 */
+const MODES = [
+  { value: 'normal', label: '普通', hint: '普通 · 不置顶' },
+  { value: 'floating', label: '悬浮', hint: '悬浮 · 置顶 + 透明度' },
+  { value: 'through', label: '穿透', hint: '穿透 · 置顶 + 鼠标穿透' },
+];
+
+function modeLabel(value) {
+  const m = MODES.find((x) => x.value === value);
+  return m ? m.label : MODES[0].label;
+}
+
+function modeHint(value) {
+  const m = MODES.find((x) => x.value === value);
+  return m ? m.hint : MODES[0].hint;
+}
+
+/** 穿透状态不跨重启保留：重启后若上次是「穿透」，降级为「悬浮」。 */
+function normalizeMode(value) {
+  if (value === 'through') return 'floating';
+  return value === 'floating' ? 'floating' : 'normal';
+}
+
 const DEFAULT_SETTINGS = {
   url: '',
   opacity: 1,
@@ -60,9 +83,10 @@ const DEFAULT_SETTINGS = {
   clickThrough: false,
   aspectIndex: 0,
   bounds: null,
-  mode: 'normal', // 'normal' | 'floating'
+  mode: 'normal', // 'normal' | 'floating' | 'through'
   floatingOpacity: 0.85,
   hideScrollbars: true,
+  startAnimation: true,
 };
 
 /**
@@ -74,6 +98,19 @@ const SCROLLBAR_CSS = `
   html, body, * { scrollbar-width: none !important; }
 `;
 
+/**
+ * 关闭开屏动画时注入到起始页的样式：跳过所有动画，直接呈现最终静态画面。
+ * （起始页的静态样式是 opacity: 0，靠动画出场，所以这里必须把终态补上。）
+ */
+const START_STATIC_CSS = `
+  .aurora, .mark, .mark .ring, .mark .page, h1, .tagline, .rule, .hint, kbd {
+    animation: none !important;
+  }
+  .mark, h1, .tagline, .hint { opacity: 1 !important; }
+  .rule { width: min(320px, 62vw) !important; opacity: 0.7 !important; }
+  .mark .ring, .mark .page { stroke-dashoffset: 0 !important; }
+`;
+
 // ---------------------------------------------------------------- 运行时状态
 
 let store = null;
@@ -82,8 +119,8 @@ let tray = null;
 let boundsTimer = null;
 
 const state = { ...DEFAULT_SETTINGS };
-/** 进入悬浮模式前的设置，用于退出时还原。 */
-let restore = { opacity: 1, alwaysOnTop: false };
+/** 进入悬浮 / 穿透前普通模式的不透明度，退出时还原。 */
+let restore = { opacity: 1 };
 
 // ---------------------------------------------------------------- 小工具
 
@@ -129,6 +166,8 @@ function publicState() {
     alwaysOnTop: state.alwaysOnTop,
     clickThrough: state.clickThrough,
     mode: state.mode,
+    modeLabel: modeLabel(state.mode),
+    modes: MODES.map((m) => m.label),
     floatingOpacity: state.floatingOpacity,
     aspectIndex: state.aspectIndex,
     aspectLabel: aspect.label,
@@ -138,6 +177,7 @@ function publicState() {
     opacityMin: Math.round(OPACITY_MIN * 100),
     opacityMax: Math.round(OPACITY_MAX * 100),
     hideScrollbars: state.hideScrollbars,
+    startAnimation: state.startAnimation,
     platform: process.platform,
   };
 }
@@ -191,6 +231,64 @@ function setHideScrollbars(v, quiet) {
   refreshTray();
 }
 
+// ---------------------------------------------------------------- 开屏动画
+
+/** 记录起始页已注入的「静态样式」key，便于撤销。 */
+const startStaticKeys = new WeakMap();
+
+function isStartPage(contents) {
+  try {
+    return contents.getURL().startsWith(pathToFileURL(START_PAGE).href);
+  } catch {
+    return false;
+  }
+}
+
+/** 起始页按需注入「跳过动画」样式；其他网页不受影响。 */
+async function applyStartAnimationCss(contents) {
+  if (!contents || contents.isDestroyed()) return;
+  const existing = startStaticKeys.get(contents);
+  try {
+    if (isStartPage(contents) && !state.startAnimation) {
+      if (existing) return;
+      const key = await contents.insertCSS(START_STATIC_CSS);
+      startStaticKeys.set(contents, key);
+    } else if (existing) {
+      startStaticKeys.delete(contents);
+      await contents.removeInsertedCSS(existing);
+    }
+  } catch {
+    // 导航过程中可能失败，忽略；下一次 dom-ready 会重新处理
+  }
+}
+
+function setStartAnimation(v, quiet) {
+  state.startAnimation = !!v;
+  store.set('startAnimation', state.startAnimation);
+  void applyStartAnimationCss(viewContents);
+  if (!quiet) hud(state.startAnimation ? '开屏动画：开' : '开屏动画：关');
+  broadcast();
+  refreshTray();
+}
+
+// ---------------------------------------------------------------- 网页缩放
+
+const ZOOM_MIN = 0.4;
+const ZOOM_MAX = 3;
+const ZOOM_STEP = 0.1;
+
+/** 网页缩放：direction > 0 放大，< 0 缩小，0 重置。 */
+function zoomView(direction, quiet) {
+  if (!viewContents || viewContents.isDestroyed()) return;
+  const cur = viewContents.getZoomFactor() || 1;
+  let next = 1;
+  if (direction > 0) next = cur * (1 + ZOOM_STEP);
+  else if (direction < 0) next = cur / (1 + ZOOM_STEP);
+  next = Math.min(ZOOM_MAX, Math.max(ZOOM_MIN, Math.round(next * 1000) / 1000));
+  viewContents.setZoomFactor(next);
+  if (!quiet) hud(`网页缩放 ${Math.round(next * 100)}%`);
+}
+
 // ---------------------------------------------------------------- 各项能力
 
 function setOpacity(v, quiet) {
@@ -208,13 +306,26 @@ function setAlwaysOnTop(v, quiet) {
   state.alwaysOnTop = !!v;
   if (hasWindow()) win.setAlwaysOnTop(state.alwaysOnTop, 'floating');
   store.set('alwaysOnTop', state.alwaysOnTop);
-  if (state.mode === 'floating') restore.alwaysOnTop = state.alwaysOnTop;
   if (!quiet) hud(state.alwaysOnTop ? '置顶：开' : '置顶：关');
   broadcast();
   refreshTray();
 }
 
+/**
+ * 重新申明置顶。
+ * Windows 在焦点切走（点击其他窗口、Alt+Tab、别的程序抢焦点）之后，
+ * 会把置顶窗口的 topmost 降级，导致本窗口退到后面、快捷键看起来「失灵」。
+ * 先取消再设置，确保 WS_EX_TOPMOST 被重新应用。
+ */
+function reassertAlwaysOnTop() {
+  if (!hasWindow() || !state.alwaysOnTop) return;
+  if (!win.isVisible() || win.isMinimized()) return;
+  win.setAlwaysOnTop(false);
+  win.setAlwaysOnTop(true, 'floating');
+}
+
 function setClickThrough(v, quiet) {
+  const wasThrough = state.clickThrough;
   state.clickThrough = !!v;
   if (hasWindow()) {
     if (state.clickThrough) {
@@ -222,37 +333,67 @@ function setClickThrough(v, quiet) {
       win.setIgnoreMouseEvents(true, { forward: true });
     } else {
       win.setIgnoreMouseEvents(false);
+      // 从穿透切回来时把窗口抬到最前，否则它可能还压在其他窗口后面，点了像没反应。
+      if (wasThrough) {
+        if (state.alwaysOnTop) reassertAlwaysOnTop();
+        win.moveTop();
+      }
     }
   }
   store.set('clickThrough', state.clickThrough);
   if (!quiet) {
-    hud(state.clickThrough ? '鼠标穿透：开（Ctrl+Alt+M 关闭）' : '鼠标穿透：关');
+    hud(state.clickThrough ? '鼠标穿透：开（Ctrl+Alt+F 切回）' : '鼠标穿透：关');
   }
   broadcast();
   refreshTray();
 }
 
-/** 悬浮浏览模式：置顶 + 预设不透明度。 */
-function toggleFloatingMode() {
+/** 由当前窗口状态推导模式（穿透 > 悬浮 > 普通）。 */
+function currentMode() {
+  if (!state.alwaysOnTop) return 'normal';
+  return state.clickThrough ? 'through' : 'floating';
+}
+
+/**
+ * 应用统一窗口模式，把「置顶 / 鼠标穿透 / 悬浮」合并成一件事：
+ * - 普通：不置顶、不穿透
+ * - 悬浮：置顶 + 预设不透明度
+ * - 穿透：置顶 + 预设不透明度 + 鼠标穿透
+ */
+function setOverlayMode(mode, quiet) {
   if (!hasWindow()) return;
-  if (state.mode === 'normal') {
-    // 先记下当前状态，再改；顺序不能颠倒，
-    // 否则 setAlwaysOnTop 内部会认为已经处于悬浮模式而覆盖 restore。
-    const prev = { opacity: state.opacity, alwaysOnTop: state.alwaysOnTop };
-    setOpacity(state.floatingOpacity, true);
-    setAlwaysOnTop(true, true);
-    state.mode = 'floating';
-    restore = prev;
-    hud(`悬浮模式：开 · 不透明度 ${Math.round(state.opacity * 100)}%`);
-  } else {
-    state.mode = 'normal';
-    setOpacity(restore.opacity, true);
-    setAlwaysOnTop(restore.alwaysOnTop, true);
-    hud('悬浮模式：关');
+  const next = MODES.some((m) => m.value === mode) ? mode : 'normal';
+  const from = currentMode();
+  if (next === from) {
+    if (!quiet) hud(`窗口模式：${modeHint(next)}`);
+    return;
   }
-  store.set('mode', state.mode);
+
+  // 从普通切到悬浮 / 穿透时，记下普通模式的不透明度，退出时还原
+  if (from === 'normal') restore.opacity = state.opacity;
+
+  state.mode = next;
+  store.set('mode', next);
+
+  setAlwaysOnTop(next !== 'normal', true);
+  setClickThrough(next === 'through', true);
+
+  if (next === 'normal') {
+    setOpacity(restore.opacity, true);
+  } else if (from === 'normal') {
+    setOpacity(state.floatingOpacity, true);
+  }
+
+  if (!quiet) hud(`窗口模式：${modeHint(next)}`);
   broadcast();
   refreshTray();
+}
+
+/** 循环切换：普通 → 悬浮 → 穿透 → 普通 …（Ctrl+Alt+F）。 */
+function cycleOverlayMode() {
+  const order = MODES.map((m) => m.value);
+  const next = order[(order.indexOf(currentMode()) + 1) % order.length];
+  setOverlayMode(next);
 }
 
 function setAspectIndex(index, quiet) {
@@ -298,6 +439,7 @@ function resetAll() {
   setAlwaysOnTop(false, true);
   setOpacity(1, true);
   setHideScrollbars(true, true);
+  setStartAnimation(true, true);
   hud('已重置');
   broadcast();
   refreshTray();
@@ -315,7 +457,9 @@ function toggleVisible() {
 function showWindow() {
   if (!hasWindow()) return;
   if (win.isMinimized()) win.restore();
+  if (state.alwaysOnTop) reassertAlwaysOnTop();
   win.show();
+  win.moveTop();
   win.focus();
 }
 
@@ -328,14 +472,22 @@ function quitApp() {
 
 function runCommand(cmd, value) {
   switch (cmd) {
-    case 'toggle-mode':
-      return toggleFloatingMode();
+    case 'cycle-mode':
+      return cycleOverlayMode();
+    case 'set-mode':
+      return setOverlayMode(value);
     case 'opacity-up':
       return setOpacity(state.opacity + OPACITY_STEP);
     case 'opacity-down':
       return setOpacity(state.opacity - OPACITY_STEP);
     case 'opacity-set':
       return setOpacity(value);
+    case 'zoom-in':
+      return zoomView(1);
+    case 'zoom-out':
+      return zoomView(-1);
+    case 'zoom-reset':
+      return zoomView(0);
     case 'size-up':
       return resizeBy(0.1);
     case 'size-down':
@@ -346,12 +498,10 @@ function runCommand(cmd, value) {
       return setAspectIndex(state.aspectIndex + (Math.trunc(Number(value)) || 1));
     case 'aspect-set':
       return setAspectIndex(value);
-    case 'toggle-top':
-      return setAlwaysOnTop(!state.alwaysOnTop);
-    case 'toggle-clickthrough':
-      return setClickThrough(!state.clickThrough);
     case 'toggle-scrollbars':
       return setHideScrollbars(!state.hideScrollbars);
+    case 'toggle-start-animation':
+      return setStartAnimation(!state.startAnimation);
     case 'toggle-panel':
       return sendCommand('toggle-panel');
     case 'toggle-urlbar':
@@ -463,6 +613,13 @@ function createWindow() {
   win.on('maximize', () => broadcast());
   win.on('unmaximize', () => broadcast());
 
+  // 点击其他窗口 / Alt+Tab 会让本窗口失焦，Windows 可能顺手丢掉 topmost。
+  // 只要还开着置顶，就重新抬一次，保证它始终浮在最前。
+  win.on('blur', () => {
+    if (!state.alwaysOnTop) return;
+    setTimeout(reassertAlwaysOnTop, 80);
+  });
+
   // 关闭 = 收到托盘（这样穿透状态下也能找回窗口），退出走托盘菜单
   win.on('close', (event) => {
     if (!app.isQuitting) {
@@ -515,28 +672,25 @@ function refreshTray() {
     { label: '显示 / 隐藏窗口 (Ctrl+Alt+H)', click: () => toggleVisible() },
     { type: 'separator' },
     {
-      label: '悬浮模式 (Ctrl+Alt+F)',
-      type: 'checkbox',
-      checked: state.mode === 'floating',
-      click: () => toggleFloatingMode(),
-    },
-    {
-      label: '窗口置顶 (Ctrl+Alt+T)',
-      type: 'checkbox',
-      checked: state.alwaysOnTop,
-      click: () => setAlwaysOnTop(!state.alwaysOnTop),
-    },
-    {
-      label: '鼠标穿透 (Ctrl+Alt+M)',
-      type: 'checkbox',
-      checked: state.clickThrough,
-      click: () => setClickThrough(!state.clickThrough),
+      label: `窗口模式：${modeLabel(currentMode())} (Ctrl+Alt+F)`,
+      submenu: MODES.map((m) => ({
+        label: m.label,
+        type: 'radio',
+        checked: currentMode() === m.value,
+        click: () => setOverlayMode(m.value),
+      })),
     },
     {
       label: '隐藏网页滚动条',
       type: 'checkbox',
       checked: state.hideScrollbars,
       click: () => setHideScrollbars(!state.hideScrollbars),
+    },
+    {
+      label: '开屏动画',
+      type: 'checkbox',
+      checked: state.startAnimation,
+      click: () => setStartAnimation(!state.startAnimation),
     },
     { type: 'separator' },
     {
@@ -586,10 +740,10 @@ function refreshTray() {
  * 只把「必须全局可用」的几个注册为系统级快捷键（会抢占其他软件的组合，
  * 因此能少则少）。其余快捷键仅在窗口有焦点时生效，见 IN_WINDOW_KEYS。
  */
+// 置顶 / 穿透 / 悬浮已合并为一个统一的「窗口模式」循环键（Ctrl+Alt+F），
+// 因此不再单独注册 Ctrl+Alt+T / Ctrl+Alt+M。
 const GLOBAL_SHORTCUTS = {
-  'CommandOrControl+Alt+F': 'toggle-mode',
-  'CommandOrControl+Alt+M': 'toggle-clickthrough',
-  'CommandOrControl+Alt+T': 'toggle-top',
+  'CommandOrControl+Alt+F': 'cycle-mode',
   'CommandOrControl+Alt+H': 'toggle-visible',
   'CommandOrControl+Alt+Q': 'quit',
 };
@@ -610,12 +764,11 @@ function registerGlobalShortcuts() {
 /** 窗口有焦点时的快捷键（不抢占系统）。 */
 const IN_WINDOW_KEYS = {
   // 调整窗口大小不再提供快捷键：直接拖窗口边缘即可
+  // 置顶 / 穿透 / 悬浮已合并：f 循环切换窗口模式
   arrowup: 'opacity-up',
   arrowdown: 'opacity-down',
   r: 'aspect-next',
-  m: 'toggle-clickthrough',
-  t: 'toggle-top',
-  f: 'toggle-mode',
+  f: 'cycle-mode',
   p: 'toggle-panel',
   l: 'toggle-urlbar',
   h: 'toggle-visible',
@@ -632,7 +785,8 @@ function onBeforeInput(event, input) {
   // Esc 无修饰键，必须在 mod 判断之前处理
   if (input.key === 'Escape') {
     sendCommand('hide-overlay');
-    if (state.clickThrough) setClickThrough(false);
+    // 穿透 / 悬浮时按 Esc：退出穿透，回到可交互的「悬浮」；确认没有残留
+    if (state.mode !== 'normal') setOverlayMode('floating', true);
     return;
   }
 
@@ -643,6 +797,25 @@ function onBeforeInput(event, input) {
     event.preventDefault();
     runCommand('toggle-urlbar');
     return;
+  }
+
+  // 网页缩放：Ctrl + = / +（含小键盘 +）放大，Ctrl + - 缩小，Ctrl + 0 重置
+  if (!input.alt) {
+    if (key === '=' || key === '+' || key === 'add') {
+      event.preventDefault();
+      zoomView(1);
+      return;
+    }
+    if (key === '-' || key === '_' || key === 'subtract') {
+      event.preventDefault();
+      zoomView(-1);
+      return;
+    }
+    if (key === '0') {
+      event.preventDefault();
+      zoomView(0);
+      return;
+    }
   }
 
   if (input.alt && !input.shift) {
@@ -682,19 +855,25 @@ function registerIpc() {
 function initSettings() {
   const file = path.join(app.getPath('userData'), 'settings.json');
   store = new Store(file, DEFAULT_SETTINGS);
+
+  const floatingOpacity = Number(store.get('floatingOpacity')) || DEFAULT_SETTINGS.floatingOpacity;
+  // 统一模式决定置顶与透明度；穿透状态不跨重启保留，避免开机点不到窗口
+  const mode = normalizeMode(store.get('mode'));
+
   Object.assign(state, {
     url: store.get('url') || '',
-    opacity: clampOpacity(store.get('opacity') ?? 1),
-    alwaysOnTop: !!store.get('alwaysOnTop'),
-    clickThrough: false, // 穿透状态不跨重启保留，避免开机点不到窗口
+    mode,
+    alwaysOnTop: mode !== 'normal',
+    clickThrough: false,
+    opacity: mode !== 'normal' ? floatingOpacity : clampOpacity(store.get('opacity') ?? 1),
     aspectIndex: Math.min(
       ASPECT_RATIOS.length - 1,
       Math.max(0, Math.trunc(Number(store.get('aspectIndex')) || 0)),
     ),
     bounds: store.get('bounds') || null,
-    mode: store.get('mode') === 'floating' ? 'floating' : 'normal',
-    floatingOpacity: Number(store.get('floatingOpacity')) || 0.85,
+    floatingOpacity,
     hideScrollbars: store.get('hideScrollbars') !== false,
+    startAnimation: store.get('startAnimation') !== false,
   });
 
   // 命令行传 URL：npm start -- https://example.com
@@ -749,10 +928,12 @@ if (!gotLock) {
         if (viewContents === contents) viewContents = null;
       });
 
-      // 隐藏网页滚动条：每次导航后注入的 CSS 会失效，需要重新注入
+      // 隐藏网页滚动条 / 关闭开屏动画：每次导航后注入的 CSS 都会失效，需要重新注入
       contents.on('dom-ready', () => {
         scrollbarCssKeys.delete(contents);
         void setScrollbarCss(contents, state.hideScrollbars);
+        startStaticKeys.delete(contents);
+        void applyStartAnimationCss(contents);
       });
 
       // 网页内的全屏只在窗口内生效；万一窗口被顶成全屏，立刻还原
@@ -765,10 +946,13 @@ if (!gotLock) {
       });
 
       contents.setWindowOpenHandler(({ url }) => {
-        if (/^https?:/i.test(url)) {
-          contents.loadURL(url);
-        } else if (/^file:|^about:/i.test(url)) {
-          contents.loadURL(url);
+        if (/^(https?|file|about):/i.test(url)) {
+          // 在同一个 webview 内打开，不新建窗口。
+          // 必须延后到 handler 返回之后再导航，否则会被紧随其后的
+          // { action: 'deny' } 取消（表现为点 target="_blank" / window.open 毫无反应）。
+          setImmediate(() => {
+            if (!contents.isDestroyed()) contents.loadURL(url).catch(() => {});
+          });
         } else {
           shell.openExternal(url).catch(() => {});
         }
@@ -787,6 +971,9 @@ if (!gotLock) {
 
   app.whenReady().then(() => {
     app.setAppUserModelId('com.framelessviewer.app');
+    // 去掉默认应用菜单：既符合「无边框、无菜单栏」的定位，
+    // 也避免它自带的缩放加速键与我们的 Ctrl + = / Ctrl + 0 处理重复触发。
+    Menu.setApplicationMenu(null);
     initSettings();
     registerIpc();
     createWindow();

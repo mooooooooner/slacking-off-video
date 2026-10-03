@@ -15,6 +15,7 @@ const urlbar = document.getElementById('urlbar');
 const urlInput = document.getElementById('url-input');
 const hud = document.getElementById('hud');
 const loading = document.getElementById('loading');
+const modeBadge = document.getElementById('mode-badge');
 
 let state = null;
 /** webview 当前实际地址，用来避免广播导致重复导航 */
@@ -23,6 +24,50 @@ let webviewReady = false;
 let pendingUrl = '';
 let hudTimer = null;
 let presetsBuilt = false;
+
+/** 开屏页地址，由主进程下发。 */
+let startUrl = '';
+/** 开屏动画进行中，以及动画结束后要进入的网页。 */
+let splashActive = false;
+let splashTarget = '';
+let splashTimer = null;
+
+/**
+ * 每次启动都先播一段开屏动画，动画结束后再进入记忆的网页。
+ * 系统开启「减少动态效果」时用静态画面，快速跳过。
+ */
+const PREFERS_REDUCED_MOTION =
+  typeof window.matchMedia === 'function' &&
+  window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+const SPLASH_MS = PREFERS_REDUCED_MOTION ? 600 : 2600;
+
+function isStartUrl(url) {
+  return !!url && !!startUrl && url === startUrl;
+}
+
+function clearSplash() {
+  clearTimeout(splashTimer);
+  splashTimer = null;
+  splashActive = false;
+}
+
+/** 展示开屏页；若记忆了网页，动画结束后自动进入。 */
+function beginSplash(target) {
+  clearSplash();
+  splashTarget = target || '';
+  splashActive = true;
+  loadUrl(startUrl);
+  if (!splashTarget) return;
+  splashTimer = setTimeout(finishSplash, SPLASH_MS);
+}
+
+function finishSplash() {
+  if (!splashActive) return;
+  const target = splashTarget;
+  clearSplash();
+  // 只有仍停在开屏页时才自动进入网页，避免覆盖用户自己的导航
+  if (target && isStartUrl(currentUrl)) loadUrl(target);
+}
 
 // ---------------------------------------------------------------- 基础工具
 
@@ -51,14 +96,38 @@ function setChip(name, active) {
   if (el) el.classList.toggle('active', !!active);
 }
 
+function setModeChips(mode) {
+  for (const btn of panel.querySelectorAll('.chip[data-mode]')) {
+    btn.classList.toggle('active', btn.dataset.mode === mode);
+  }
+}
+
 function updateSizeLabel() {
   sizeLabel.textContent = `${window.innerWidth} × ${window.innerHeight}`;
+}
+
+/** 非普通模式时常驻一个小徽标：既提示当前模式，也解释穿透时点击为何落空。 */
+function updateModeBadge(mode) {
+  if (!modeBadge) return;
+  if (!mode || mode === 'normal') {
+    hide(modeBadge);
+    modeBadge.classList.remove('through');
+    return;
+  }
+  const through = mode === 'through';
+  modeBadge.classList.toggle('through', through);
+  modeBadge.textContent = through
+    ? '穿透中 · 点击已穿透 · 按 Ctrl+Alt+F 切回'
+    : '悬浮 · 按 Ctrl+Alt+F 切换';
+  show(modeBadge);
 }
 
 // ---------------------------------------------------------------- 导航
 
 function loadUrl(url) {
   if (!url) return;
+  // 用户自己导航去别处时，取消尚未结束的开屏跳转
+  if (!isStartUrl(url)) clearSplash();
   currentUrl = url;
   if (!webviewReady) {
     pendingUrl = url;
@@ -91,17 +160,26 @@ function applyState(next) {
   opacityValue.textContent = `${percent}%`;
   aspectLabel.textContent = next.aspectLabel;
 
-  setChip('mode', next.mode === 'floating');
-  setChip('top', next.alwaysOnTop);
-  setChip('through', next.clickThrough);
+  setModeChips(next.mode);
   setChip('scrollbars', next.hideScrollbars);
+  setChip('startanimation', next.startAnimation);
 
   buildSizePresets(next.sizePresets);
 
-  // 首次拿到状态时决定加载哪个页面
+  // 记住开屏页地址
+  startUrl = next.startUrl || startUrl;
+
+  // 首次拿到状态时决定加载哪个页面：
+  // 默认先播一段开屏动画，动画结束后再进入记忆的网页；关掉开屏动画则直接进入。
   if (!currentUrl && !pendingUrl) {
-    loadUrl(next.url || next.startUrl);
+    if (next.startAnimation) beginSplash(next.url);
+    else loadUrl(next.url || next.startUrl);
+  } else if (splashActive && !next.startAnimation) {
+    // 开屏途中把「开屏动画」关掉：立即进入网页
+    finishSplash();
   }
+
+  updateModeBadge(next.mode);
 }
 
 function buildSizePresets(presets) {
@@ -166,13 +244,17 @@ panel.addEventListener('click', (event) => {
   const target = event.target.closest('button');
   if (!target) return;
 
+  const mode = target.dataset.mode;
+  if (mode) {
+    void api.run('set-mode', mode);
+    return;
+  }
+
   const toggleName = target.dataset.toggle;
   if (toggleName) {
     const map = {
-      mode: 'toggle-mode',
-      top: 'toggle-top',
-      through: 'toggle-clickthrough',
       scrollbars: 'toggle-scrollbars',
+      startanimation: 'toggle-start-animation',
     };
     void api.run(map[toggleName]);
     return;
@@ -237,10 +319,8 @@ view.addEventListener('did-fail-load', (event) => {
   showHud(`加载失败：${event.errorDescription || event.errorCode}`);
 });
 
-view.addEventListener('new-window', (event) => {
-  event.preventDefault();
-  loadUrl(event.url);
-});
+// 注：target="_blank" / window.open 由主进程的 setWindowOpenHandler 统一处理
+// （在同一 webview 内打开），<webview> 的 new-window 事件已在 Electron 22 移除。
 
 // ---------------------------------------------------------------- 主进程命令
 
