@@ -134,9 +134,27 @@
 | 项 | 内容 |
 | --- | --- |
 | 需求 | 点击网页里的各种链接都能正常跳转，包括 `target="_blank"` / `window.open` 打开的「新窗口」链接 |
-| 验收 | 普通链接、`target="_blank"`、`window.open` 均在**同一个 webview 内**打开（不新建系统窗口）；非 `http(s)/file/about` 协议（如 `mailto:`、`tg:`）交给系统处理 |
+| 验收 | 普通链接、`target="_blank"`、`window.open` 均在**同一个 webview 内**打开（不新建系统窗口）；`mailto:` / `tel:` 交给系统处理，其他私有协议由应用拦截（见 FR-15） |
 | 实现 | `<webview allowpopups>` + 主进程 `setWindowOpenHandler` 返回 `deny`，并在 `setImmediate` 中 `loadURL`。**缺少 `allowpopups` 时 Chromium 会在请求到达 handler 之前就拦掉弹窗**，表现为这类链接点了没反应 |
 | 备注 | 单视图设计：链接始终在原窗口内打开，不产生多标签 / 多窗口 |
+
+### FR-14 一键隐藏窗口
+
+| 项 | 内容 |
+| --- | --- |
+| 需求 | 用**鼠标侧键**一键把窗口隐藏 / 恢复，替代原来的键盘快捷键 |
+| 验收 | 按下鼠标侧键（前进 / 后退任一）切换窗口显隐；窗口有焦点时生效 |
+| 实现 | 双路径监听并对同一次按键去抖：① 窗口 `app-command`（`browser-backward` / `browser-forward`）；② 各 webContents（外壳 + webview）的 `before-mouse-event`，识别 `button` 为 `back` / `forward` / `3` / `4`，并 `preventDefault` 掉侧键的默认导航 |
+| 备注 | 侧键只在前台窗口可见时可用，窗口隐藏后请点**托盘图标**恢复；原全局快捷键 `Ctrl+Alt+H` 已移除，全局快捷键收窄为 F / Q |
+
+### FR-15 拦截网页发起的私有协议
+
+| 项 | 内容 |
+| --- | --- |
+| 需求 | 网页试图打开本机 App 的私有协议时，不得交给操作系统弹出「此设备无法打开此链接 / Microsoft Store」窗口 |
+| 验收 | 抖音网页版看视频时不再持续弹系统窗口；站点通过 `window.open`、`location.href`、iframe、重定向发起 `bytedance://` / `snssdk1128://` / `aweme://` / `bitbrowser://` 等协议时均被拦截，HUD 提示「已拦截外部应用跳转」；`mailto:` / `tel:` 仍可交给系统 |
+| 实现 | 协议白名单：导航允许 `http(s)/file/about/blob/data`，同窗口加载仅 `http(s)/file/about`；可外部打开协议仅 `mailto/tel`。`setWindowOpenHandler` 不再 `shell.openExternal` 任意协议；并以 `will-frame-navigate` / `will-redirect` 兜底拦截导航 |
+| 备注 | 这是「不修改站点脚本」前提下的最小干预；如确有需要打开某个外部 App，可在白名单中显式添加对应协议 |
 
 ---
 
@@ -162,7 +180,7 @@
 | 网页弹窗 | `<webview allowpopups>` + `setWindowOpenHandler` 返回 `deny` + `setImmediate(loadURL)` | 单视图内跳转；缺少 `allowpopups` 时弹窗会在到达 handler 前被 Chromium 拦掉，`target="_blank"` 链接点了没反应 |
 | 全屏 | `fullscreenable: true` + `disableHtmlFullscreenWindowResize: true` | 设 `fullscreenable: false` 会让 `requestFullscreen()` 直接失败，反而不满足 FR-7 |
 | 滚动条 | `webContents.insertCSS()` | 不改站点代码，只覆盖外观；导航后重新注入 |
-| 全局快捷键 | 仅 F / H / Q | 置顶 / 穿透 / 悬浮合并为 `F` 的模式循环；曾把 `Ctrl+Alt+方向键` 注册为全局，会直接破坏其他软件的组合键 |
+| 全局快捷键 | 仅 F / Q | 置顶 / 穿透 / 悬浮合并为 `F` 的模式循环；「显示 / 隐藏窗口」改用鼠标侧键（前进键 / XBUTTON2），不占用全局组合键；曾把 `Ctrl+Alt+方向键` 注册为全局，会直接破坏其他软件的组合键 |
 | 应用菜单 | `Menu.setApplicationMenu(null)` | 符合无边框定位；并避免默认菜单的缩放加速键与自实现的 `Ctrl + =` / `Ctrl + 0` 重复触发 |
 | 开屏动画 | 纯 CSS，关闭时 `insertCSS` 注入静态样式 | 起始页无需脚本（CSP 默认禁止），只有起始页会注入，不影响真实网页 |
 

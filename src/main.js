@@ -187,12 +187,88 @@ function normalizeUrl(input) {
   let u = String(input || '').trim();
   if (!u) return '';
   if (/^(https?|file|about|view-source|chrome|edge|devtools):/i.test(u)) return u;
-  if (/^[a-z][a-z0-9+.-]*:\/\//i.test(u)) return u;
+  // 其他带 scheme:// 的私有协议（bytedance://、snssdk1128:// 等）既不在应用内加载，
+  // 也不交给系统，统一当作搜索词处理，避免误触发外部 App / Microsoft Store。
+  if (/^[a-z][a-z0-9+.-]*:\/\//i.test(u)) {
+    return 'https://www.bing.com/search?q=' + encodeURIComponent(u);
+  }
   if (/^(localhost|127\.0\.0\.1|\[::1\]|\d{1,3}(\.\d{1,3}){3})(:\d+)?([/?#].*)?$/i.test(u)) {
     return 'http://' + u;
   }
   if (/^[^\s/?#]+\.[^\s/?#]+([/?#].*)?$/.test(u)) return 'https://' + u;
   return 'https://www.bing.com/search?q=' + encodeURIComponent(u);
+}
+
+// ---------------------------------------------------------------- 外部协议
+
+/**
+ * 网页里允许直接加载的协议（留在同一个 webview 内）。
+ * 另允许 blob: / data: 作为子框架 / 内嵌页面的导航协议。
+ */
+const LOADABLE_PROTOCOLS = new Set(['http:', 'https:', 'file:', 'about:']);
+const NAVIGATION_PROTOCOLS = new Set([...LOADABLE_PROTOCOLS, 'blob:', 'data:', 'chrome-error:']);
+
+/**
+ * 允许交给操作系统的外部协议。
+ *
+ * 抖音等站点会反复尝试打开自家 App 的私有协议（bytedance://、snssdk1128://、
+ * aweme:// 等，以及第三方残留的 bitbrowser://）。在 Windows 上把这些协议交给
+ * 系统处理时，未注册的协议会弹出「此设备无法打开此链接 / 需要到 Microsoft Store
+ * 下载应用」的系统窗口，而且站点会反复重试，导致持续弹窗。
+ *
+ * 因此这里改成白名单：只放行真正需要系统程序接管的 mailto: / tel:，
+ * 其余自定义协议一律在应用内静默拦截。既避免弹窗，也避免误拉起本机应用。
+ */
+const EXTERNAL_PROTOCOLS = new Set(['mailto:', 'tel:']);
+
+function protocolOf(url) {
+  try {
+    return new URL(String(url || '')).protocol.toLowerCase();
+  } catch {
+    return '';
+  }
+}
+
+function isLoadableUrl(url) {
+  return LOADABLE_PROTOCOLS.has(protocolOf(url));
+}
+
+function isAllowedNavigation(url) {
+  return NAVIGATION_PROTOCOLS.has(protocolOf(url));
+}
+
+/** 拦截提示：每种协议每次运行只提示一次，避免站点反复尝试时 HUD 刷屏。 */
+const blockedProtocolTips = new Set();
+function notifyBlockedProtocol(url, source) {
+  const proto = protocolOf(url);
+  if (IS_DEV) {
+    console.warn(`[security] 已拦截外部协议（${source}）: ${proto || '?'} ${url}`);
+  }
+  if (!proto || blockedProtocolTips.has(proto)) return;
+  blockedProtocolTips.add(proto);
+  hud(`已拦截外部应用跳转：${proto.replace(/:$/, '')}`);
+}
+
+/** 只把白名单协议交给系统，其余一律拦截（不再触发 Microsoft Store 弹窗）。 */
+function openExternalSafely(url) {
+  if (EXTERNAL_PROTOCOLS.has(protocolOf(url))) {
+    shell.openExternal(url).catch(() => {});
+    return;
+  }
+  notifyBlockedProtocol(url, 'window.open');
+}
+
+/**
+ * 导航 / 重定向到非网页协议时的统一出口：
+ * mailto: / tel: 交给系统，其余（bytedance:// 等）拦截并提示。
+ */
+function handleExternalNavigation(event, url, source) {
+  event.preventDefault();
+  if (EXTERNAL_PROTOCOLS.has(protocolOf(url))) {
+    openExternalSafely(url);
+    return;
+  }
+  notifyBlockedProtocol(url, source);
 }
 
 // ---------------------------------------------------------------- 网页滚动条
@@ -454,6 +530,35 @@ function toggleVisible() {
   }
 }
 
+/**
+ * 鼠标侧键触发的显隐切换。
+ * 同一次物理按键可能从多条路径各触发一次（原生 app-command、驱动模拟的
+ * Alt+←/→、渲染进程鼠标事件），这里做去抖，保证「按一次 = 切一次」。
+ * 顺带规避 Electron 侧键重复触发 / 双击动作的已知问题。
+ */
+let lastSideButtonAt = 0;
+function toggleFromSideButton() {
+  const now = Date.now();
+  if (now - lastSideButtonAt < 300) return;
+  lastSideButtonAt = now;
+  toggleVisible();
+}
+
+/**
+ * 把「按钮 3 / 4（后退 / 前进）」当作鼠标侧键处理。
+ * 挂在每个 webContents（含 webview）上，覆盖驱动把侧键上报为普通鼠标键的情况。
+ */
+function onSideMouseEvent(event, mouse) {
+  if (!mouse || (mouse.type !== 'mouseDown' && mouse.type !== 'mouseUp')) return;
+  const button = String(mouse.button);
+  const isSide = button === 'back' || button === 'forward' || button === '3' || button === '4';
+  if (!isSide) return;
+  if (IS_DEV) console.log(`[mouse] before-mouse-event: button=${button} type=${mouse.type}`);
+  // 拦掉默认行为（例如网页把侧键当历史后退），只做显隐切换
+  event.preventDefault();
+  if (mouse.type === 'mouseDown') toggleFromSideButton();
+}
+
 function showWindow() {
   if (!hasWindow()) return;
   if (win.isMinimized()) win.restore();
@@ -613,6 +718,17 @@ function createWindow() {
   win.on('maximize', () => broadcast());
   win.on('unmaximize', () => broadcast());
 
+  // 鼠标侧键：一键显示 / 隐藏窗口。
+  // 覆盖两条原生路径，避免不同鼠标 / 驱动上报方式不一致导致「没反应」：
+  //   - app-command：标准 XBUTTON（backward / forward）走 WM_APPCOMMAND；
+  //   - before-mouse-event：鼠标驱动把侧键当作普通鼠标键（button 3 / 4）上报时，
+  //     这里能拿到按钮编号（对所有 webContents 挂载，见 web-contents-created）。
+  // 只在前台窗口触发，窗口隐藏后请点托盘图标恢复。
+  win.on('app-command', (_event, command) => {
+    if (IS_DEV) console.log(`[mouse] app-command: ${command}`);
+    if (command === 'browser-forward' || command === 'browser-backward') toggleFromSideButton();
+  });
+
   // 点击其他窗口 / Alt+Tab 会让本窗口失焦，Windows 可能顺手丢掉 topmost。
   // 只要还开着置顶，就重新抬一次，保证它始终浮在最前。
   win.on('blur', () => {
@@ -669,7 +785,7 @@ function createTray() {
 function refreshTray() {
   if (!tray) return;
   const template = [
-    { label: '显示 / 隐藏窗口 (Ctrl+Alt+H)', click: () => toggleVisible() },
+    { label: '显示 / 隐藏窗口 (鼠标侧键)', click: () => toggleVisible() },
     { type: 'separator' },
     {
       label: `窗口模式：${modeLabel(currentMode())} (Ctrl+Alt+F)`,
@@ -742,9 +858,10 @@ function refreshTray() {
  */
 // 置顶 / 穿透 / 悬浮已合并为一个统一的「窗口模式」循环键（Ctrl+Alt+F），
 // 因此不再单独注册 Ctrl+Alt+T / Ctrl+Alt+M。
+// 「显示 / 隐藏窗口」改用鼠标侧键（前进键 / XBUTTON2）触发，
+// 见窗口的 app-command 监听，不再占用全局组合键。
 const GLOBAL_SHORTCUTS = {
   'CommandOrControl+Alt+F': 'cycle-mode',
-  'CommandOrControl+Alt+H': 'toggle-visible',
   'CommandOrControl+Alt+Q': 'quit',
 };
 
@@ -771,7 +888,7 @@ const IN_WINDOW_KEYS = {
   f: 'cycle-mode',
   p: 'toggle-panel',
   l: 'toggle-urlbar',
-  h: 'toggle-visible',
+  // 显示 / 隐藏窗口已改用鼠标侧键（前进键），不再保留窗口内快捷键
   s: 'toggle-scrollbars',
   q: 'quit',
   '0': 'reset',
@@ -919,6 +1036,8 @@ if (!gotLock) {
 
   app.on('web-contents-created', (_event, contents) => {
     contents.on('before-input-event', onBeforeInput);
+    // 鼠标侧键（含网页内）：无论焦点在无边框外壳还是 webview，都能切换窗口显隐
+    contents.on('before-mouse-event', onSideMouseEvent);
 
     if (IS_DEV) forwardConsole(contents, contents.getType());
 
@@ -945,8 +1064,22 @@ if (!gotLock) {
         sendCommand('html-fullscreen', { on: false });
       });
 
+      // 只允许网页协议在应用内导航。抖音等站点会用 bytedance:// / snssdk1128:// /
+      // aweme:// 反复申请打开本机 App，落到 Windows 上就是持续的
+      // 「此设备无法打开此链接 / Microsoft Store」弹窗，这里直接拦截。
+      contents.on('will-frame-navigate', (event) => {
+        if (isAllowedNavigation(event.url)) return;
+        handleExternalNavigation(event, event.url, 'navigation');
+      });
+
+      // 重定向同样可能被站点用作跳转到私有协议的路径
+      contents.on('will-redirect', (event) => {
+        if (isAllowedNavigation(event.url)) return;
+        handleExternalNavigation(event, event.url, 'redirect');
+      });
+
       contents.setWindowOpenHandler(({ url }) => {
-        if (/^(https?|file|about):/i.test(url)) {
+        if (isLoadableUrl(url)) {
           // 在同一个 webview 内打开，不新建窗口。
           // 必须延后到 handler 返回之后再导航，否则会被紧随其后的
           // { action: 'deny' } 取消（表现为点 target="_blank" / window.open 毫无反应）。
@@ -954,7 +1087,9 @@ if (!gotLock) {
             if (!contents.isDestroyed()) contents.loadURL(url).catch(() => {});
           });
         } else {
-          shell.openExternal(url).catch(() => {});
+          // 非网页协议交给白名单处理；私有协议会被拦截并提示，
+          // 不会再交给系统去拉 Microsoft Store。
+          openExternalSafely(url);
         }
         return { action: 'deny' };
       });

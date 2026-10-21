@@ -292,6 +292,21 @@ document.addEventListener('keydown', (event) => {
   }
 });
 
+/**
+ * 鼠标侧键兜底：某些鼠标 / 驱动把侧键（后退 / 前进）当作普通鼠标按钮
+ * （`event.button` 为 3 / 4）上报，此时走不到主进程的 app-command。
+ * 这里监听外壳自身，命中侧键就切换窗口显隐（主进程已做去抖）。
+ */
+document.addEventListener(
+  'mousedown',
+  (event) => {
+    if (event.button !== 3 && event.button !== 4) return;
+    event.preventDefault();
+    if (api) void api.run('toggle-visible');
+  },
+  true,
+);
+
 window.addEventListener('resize', updateSizeLabel);
 
 // ---------------------------------------------------------------- webview 事件
